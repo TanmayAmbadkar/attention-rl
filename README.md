@@ -50,14 +50,14 @@ python main.py \--env\_id "Hopper-v5" \--agent\_type "continuous"
 This is the most advanced configuration. It uses rendered images as observations, a VQ-VAE to create a spatial grid of codes, and the attention-based agent to process it.
 
 ```bash
-python main.py \\
-    \--env\_id "Hopper-v5" \\
-    \--agent\_type "attention" \\
-    \--use\_image\_obs=True \\
-    \--use\_vqvae=True \\
-    \--num\_prototypes 32 \\
-    \--vq\_embedding\_dim 128 \\
-    \--total\_timesteps 2000000
+python main.py
+    --env_id "Hopper-v5" \
+    --agent_type "attention" \
+    --use_image_obs True \
+    --use_vqvae True \
+    --num_prototypes 32 \
+    --vq_embedding_dim 128 \
+    --total_timesteps 2000000
 ```
 
 ## **Monitoring Training**
