@@ -42,7 +42,7 @@ The main entry point is main.py. You can configure different experiments using c
 This is the baseline experiment using a standard PPO agent on a feature-based environment.
 
 ```bash
-python main.py \--env\_id "Hopper-v5" \--agent\_type "continuous"
+python main.py --env_id "Hopper-v5" --agent_type "continuous"
 ```
 
 ### **Example 2: Train the full** AttentionPrototypeAgent **on images**
