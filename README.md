@@ -13,17 +13,25 @@ The entire system is trained end-to-end using a robust Proximal Policy Optimizat
 ## **Installation**
 
 1. **Clone the repository:**
+   ```bash
    git clone https://github.com/TanmayAmbadkar/attention-rl.git
    cd attention-rl
+   ```
 
 2. **Create and activate a virtual environment** (recommended):
+
+   ```bash
    python \-m venv venv
    source venv/bin/activate
+   ```
 
 3. Install the required dependencies:
    The project uses pre-commit hooks for code quality. After cloning and creating your virtual environment, install them.
+
+   ```bash
    pip install \-r requirements.txt
    pre-commit install
+   ```
 
 ## **How to Run**
 
@@ -33,12 +41,15 @@ The main entry point is main.py. You can configure different experiments using c
 
 This is the baseline experiment using a standard PPO agent on a feature-based environment.
 
+```bash
 python main.py \--env\_id "Hopper-v5" \--agent\_type "continuous"
+```
 
 ### **Example 2: Train the full** AttentionPrototypeAgent **on images**
 
 This is the most advanced configuration. It uses rendered images as observations, a VQ-VAE to create a spatial grid of codes, and the attention-based agent to process it.
 
+```bash
 python main.py \\
     \--env\_id "Hopper-v5" \\
     \--agent\_type "attention" \\
@@ -47,12 +58,14 @@ python main.py \\
     \--num\_prototypes 32 \\
     \--vq\_embedding\_dim 128 \\
     \--total\_timesteps 2000000
-
+```
 
 ## **Monitoring Training**
 
 This project uses TensorBoard for logging. To launch it while training is in progress, run the following command in your terminal:
 
+```bash
 tensorboard \--logdir runs
+```
 
 Navigate to http://localhost:6006 in your browser. You can monitor key metrics such as charts/episodic\_return, losses/policy\_loss, and the VQ-VAE specific charts/vq\_perplexity.
