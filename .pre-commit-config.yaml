@@ -1,0 +1,35 @@
+# .pre-commit-config.yaml
+repos:
+-   repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+    -   id: trailing-whitespace
+    -   id: end-of-file-fixer
+    -   id: check-yaml
+    -   id: check-added-large-files
+
+-   repo: https://github.com/psf/black
+    rev: 24.4.2
+    hooks:
+    -   id: black
+
+-   repo: https://github.com/pycqa/isort
+    rev: 5.13.2
+    hooks:
+      - id: isort
+        name: isort (python)
+
+# -   repo: https://github.com/pycqa/pydocstyle
+#     rev: 6.3.0
+#     hooks:
+#     -   id: pydocstyle
+#         # Exclude tests from docstring requirements
+#         exclude: ^(tests/|docs/|examples/)
+
+-   repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.10.0
+    hooks:
+    -   id: mypy
+        # You might need to add this if mypy needs packages from your requirements
+        additional_dependencies: [ "types-requests" ]
+        exclude: ^(tests/|docs/|examples/)

@@ -1,0 +1,6 @@
+runs
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.mypy_cache
