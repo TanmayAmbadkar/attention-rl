@@ -5,7 +5,9 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from sklearn.cluster import KMeans, MiniBatchKMeans
 from torch.utils.tensorboard import SummaryWriter
+from tqdm import tqdm
 
 
 class LinearLRSchedule:
@@ -66,7 +68,11 @@ class PPOLogger:
         if self.use_tensorboard:
             for key, value in update_results.items():
                 # Assumes keys are like "losses/policy_loss", "charts/perplexity", etc.
-                self.writer.add_scalar(key, value, global_step)
+                if type(value) is list:
+                    for i, v in enumerate(value):
+                        self.writer.add_scalar(f"{key}/{i}", v, global_step)
+                else:
+                    self.writer.add_scalar(key, value, global_step)
 
 
 class PPO:
@@ -76,6 +82,9 @@ class PPO:
         optimizer,
         envs,
         vqvae=None,
+        vqvae_warmup_steps=100000,
+        vqvae_train_epochs=100,
+        kmeans_init_steps=4096,
         vq_embedding_dim=None,
         vq_loss_coefficient=0.1,
         dissimilarity_loss_coefficient=0.1,
@@ -87,6 +96,7 @@ class PPO:
         surrogate_clip_threshold=0.2,
         entropy_loss_coefficient=0.01,
         value_function_loss_coefficient=0.5,
+        policy_gradient_loss_coefficient=4.0,
         max_grad_norm=0.5,
         update_epochs=10,
         num_minibatches=32,
@@ -102,6 +112,8 @@ class PPO:
         self.optimizer = optimizer
         self.seed = seed
         self.vqvae = vqvae
+        self.vqvae_warmup_steps = vqvae_warmup_steps
+        self.vqvae_train_epochs = vqvae_train_epochs
         self.vq_loss_coefficient = vq_loss_coefficient
         self.dissimilarity_loss_coefficient = dissimilarity_loss_coefficient
         self.num_rollout_steps = num_rollout_steps
@@ -118,11 +130,13 @@ class PPO:
         self.update_epochs = update_epochs
         self.normalize_advantages = normalize_advantages
         self.clip_value_function_loss = clip_value_function_loss
+        self.policy_gradient_loss_coefficient = policy_gradient_loss_coefficient
         self.target_kl = target_kl
         self.device = next(agent.parameters()).device
         self.anneal_lr = anneal_lr
         self.initial_lr = learning_rate
         self.lr_scheduler = None
+        self.kmeans_init_steps = kmeans_init_steps
         self._global_step = 0
         self.logger = logger or PPOLogger()
 
@@ -145,36 +159,180 @@ class PPO:
 
         return LinearLRSchedule(self.optimizer, self.initial_lr, num_policy_updates)
 
-    def learn(self, total_timesteps):
-        num_policy_updates = total_timesteps // self.batch_size
-        if self.anneal_lr:
-            self.lr_scheduler = self.create_lr_scheduler(num_policy_updates)
-        next_observation, is_next_observation_terminal = self._initialize_environment()
-        self._global_step = 0
-        for update in range(1, num_policy_updates + 1):
-            if self.anneal_lr:
-                self.lr_scheduler.step()
-            rollout_data = self.collect_rollouts(
-                next_observation, is_next_observation_terminal
-            )
-            next_observation = rollout_data[-2]
-            is_next_observation_terminal = rollout_data[-1]
-            update_results = self.update_policy(*rollout_data[:-2])
-            self.logger.log_policy_update(update_results, self._global_step)
-        print(f"Training completed. Total steps: {self._global_step}")
-        return self.agent
-
     def _initialize_environment(self):
         initial_observation, _ = self.envs.reset(seed=self.seed)
         initial_observation = torch.Tensor(initial_observation).to(self.device)
         is_initial_observation_terminal = torch.zeros(self.num_envs, device=self.device)
         return initial_observation, is_initial_observation_terminal
 
-    def collect_rollouts(self, next_observation, is_next_observation_terminal):
+    # MODIFICATION: New method to perform K-Means initialization
+    def _initialize_codebook_with_kmeans(self):
+        """
+        Initializes the VQ-VAE codebook using K-Means clustering.
+        """
+        if KMeans is None:
+            print(
+                "Warning: scikit-learn is not installed. Skipping K-Means initialization."
+            )
+            return
+
+        # 1. Collect a buffer of data using a random policy
+        num_batches = self.kmeans_init_steps // self.batch_size + 1
+        print(
+            f"--- Starting K-Means Initialization for {self.kmeans_init_steps} steps ---, Batches {num_batches}"
+        )
+        all_encoded_vectors = []
+
+        next_obs, _ = self._initialize_environment()
+        kmeans = MiniBatchKMeans(
+            n_clusters=self.vqvae.vq_layer.num_embeddings,
+            n_init="auto",
+            batch_size=self.minibatch_size,
+            max_iter=300,
+            random_state=self.seed,
+        )
+
+        for _ in tqdm(range(num_batches), desc="K-Means Data Collection"):
+            # We only need the raw observations for this
+            rollout_data = self.collect_rollouts(
+                next_obs, None, use_random_actions=True, collect_full_trajectory=False
+            )
+            raw_obs_batch = rollout_data[0]  # The raw observations
+            next_obs = rollout_data[-2]  # The next observation to continue the rollout
+
+            with torch.no_grad():
+                # Pass observations through the encoder to get latent vectors
+
+                for start in range(0, self.batch_size, self.minibatch_size):
+                    end = start + self.minibatch_size
+                    encoded_vectors = self.vqvae.encoder(raw_obs_batch[start:end])
+                    # For grid-based VQ, flatten the spatial dimensions
+                    if len(encoded_vectors.shape) == 4:
+                        encoded_vectors = encoded_vectors.permute(
+                            0, 2, 3, 1
+                        ).contiguous()
+                    # all_encoded_vectors.append(encoded_vectors.view(-1, self.vqvae.vq_layer.embedding_dim).cpu().numpy())
+
+                    kmeans.partial_fit(
+                        encoded_vectors.view(-1, self.vqvae.vq_layer.embedding_dim)
+                        .cpu()
+                        .numpy()
+                    )
+                print(self.vqvae.vq_layer.embedding.weight)
+
+        # all_encoded_vectors = np.concatenate(all_encoded_vectors, axis=0)
+
+        # 2. Run K-Means on the collected latent vectors
+        print("Fitting complete. Initializing codebook with K-Means centroids...")
+        cluster_centers = torch.tensor(
+            kmeans.cluster_centers_, dtype=torch.float32, device=self.device
+        )
+        self.vqvae.vq_layer.embedding.weight.data.copy_(cluster_centers)
+
+        print("--- K-Means Initialization Finished ---")
+
+    def learn(self, total_timesteps):
+        next_observation, is_next_observation_terminal = self._initialize_environment()
+        self._global_step = 0
+
+        # --- PHASE 0: K-MEANS INITIALIZATION (NEW) ---
+        if self.vqvae and self.kmeans_init_steps > 0:
+            self._initialize_codebook_with_kmeans()
+
+        # --- PHASE 1: VQ-VAE WARM-UP ---
+        if self.vqvae and self.vqvae_warmup_steps > 0:
+            print(
+                f"--- Starting VQ-VAE Warm-up Phase for {self.vqvae_warmup_steps} steps ---"
+            )
+
+            self.vqvae.eval()
+            warmup_steps_done = 0
+            while warmup_steps_done < self.vqvae_warmup_steps:
+                rollout_data = self.collect_rollouts(
+                    next_observation,
+                    is_next_observation_terminal,
+                    use_random_actions=True,
+                )
+                next_observation = rollout_data[-2]
+                is_next_observation_terminal = rollout_data[-1]
+                warmup_steps_done += self.batch_size
+
+                self.vqvae.train()
+                update_results = self.update_vqvae_only(rollout_data[0])
+                self.logger.log_policy_update(update_results, self._global_step)
+
+            print("--- VQ-VAE Warm-up Phase Finished ---")
+            next_observation, is_next_observation_terminal = (
+                self._initialize_environment()
+            )
+
+        # --- PHASE 2: JOINT PPO + VQ-VAE TRAINING ---
+        remaining_timesteps = total_timesteps - self._global_step
+        num_policy_updates = remaining_timesteps // self.batch_size
+        if self.anneal_lr:
+            self.lr_scheduler = self.create_lr_scheduler(num_policy_updates)
+
+        for update in range(1, num_policy_updates + 1):
+            if self.anneal_lr:
+                self.lr_scheduler.step()
+
+            self.vqvae.eval()
+            rollout_data = self.collect_rollouts(
+                next_observation, is_next_observation_terminal, use_random_actions=False
+            )
+            next_observation = rollout_data[-2]
+            is_next_observation_terminal = rollout_data[-1]
+
+            self.vqvae.train()
+            update_results = self.update_policy(*rollout_data[:-2])
+            self.logger.log_policy_update(update_results, self._global_step)
+
+        print(f"Training completed. Total steps: {self._global_step}")
+        return self.agent
+
+    # MODIFICATION: Add a flag to simplify data collection for K-Means/Warmup
+    def collect_rollouts(
+        self,
+        next_observation,
+        is_next_observation_terminal,
+        use_random_actions=False,
+        collect_full_trajectory=True,
+    ):
         raw_observations_storage = torch.zeros(
             (self.num_rollout_steps, self.num_envs)
             + self.envs.single_observation_space.shape
         ).to(self.device)
+
+        if not collect_full_trajectory:
+            # Simplified loop for just collecting raw observations
+            for step in range(self.num_rollout_steps):
+                raw_observations_storage[step] = next_observation
+                action = torch.as_tensor(
+                    np.array(
+                        [
+                            self.envs.single_action_space.sample()
+                            for _ in range(self.num_envs)
+                        ]
+                    )
+                ).to(self.device)
+                next_observation, _, _, _, _ = self.envs.step(action.cpu().numpy())
+                next_observation = torch.as_tensor(
+                    next_observation, dtype=torch.float32, device=self.device
+                )
+            return (
+                raw_observations_storage.reshape(
+                    (-1,) + self.envs.single_observation_space.shape
+                ),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                next_observation,
+                None,
+            )
+
         agent_observations_storage = torch.zeros(
             (self.num_rollout_steps, self.num_envs) + self.agent_obs_shape
         ).to(self.device)
@@ -201,17 +359,29 @@ class PPO:
             with torch.no_grad():
                 if self.vqvae is not None:
                     agent_observation, _, _, _ = self.vqvae.vq_layer(
-                        self.vqvae.encoder(next_observation), is_training=True
+                        self.vqvae.encoder(next_observation)
                     )
                 else:
                     agent_observation = next_observation
 
-                agent_observations_storage[step] = agent_observation
-                action, logprob = self.agent.sample_action_and_compute_log_prob(
-                    agent_observation
-                )
+                if use_random_actions:
+                    action = torch.as_tensor(
+                        np.array(
+                            [
+                                self.envs.single_action_space.sample()
+                                for _ in range(self.num_envs)
+                            ]
+                        )
+                    ).to(self.device)
+                    logprob = torch.zeros(self.num_envs).to(self.device)
+                else:
+                    action, logprob = self.agent.sample_action_and_compute_log_prob(
+                        agent_observation
+                    )
+
                 value = self.agent.estimate_value_from_observation(agent_observation)
 
+            agent_observations_storage[step] = agent_observation
             values_storage[step] = value.flatten()
             actions_storage[step] = action
             log_probs_storage[step] = logprob
@@ -233,7 +403,7 @@ class PPO:
         with torch.no_grad():
             if self.vqvae is not None:
                 final_agent_obs, _, _, _ = self.vqvae.vq_layer(
-                    self.vqvae.encoder(next_observation), is_training=False
+                    self.vqvae.encoder(next_observation)
                 )
             else:
                 final_agent_obs = next_observation
@@ -306,6 +476,68 @@ class PPO:
         returns = advantages + values
         return advantages, returns
 
+    def update_vqvae_only(self, batch_raw_observations):
+        """
+        Performs updates on the VQ-VAE only, using reconstruction and VQ loss.
+        This is used during the warm-up phase.
+        """
+        batch_indices = np.arange(self.batch_size)
+
+        vqvae_minibatch_size = self.batch_size // self.num_minibatches
+
+        print(vqvae_minibatch_size, self.minibatch_size)
+
+        vq_losses, recon_losses, perplexities = [], [], []
+        with tqdm(range(self.vqvae_train_epochs), desc="VQ-VAE Warm-up") as pbar:
+            for epoch in pbar:
+
+                np.random.shuffle(batch_indices)
+                epoch_vq_losses, epoch_recon_losses, epoch_perplexities = [], [], []
+                for start in range(0, self.batch_size, vqvae_minibatch_size):
+                    end = start + self.minibatch_size
+                    minibatch_indices = batch_indices[start:end]
+
+                    raw_obs_mb = batch_raw_observations[minibatch_indices]
+                    recon_obs_mb, vq_loss_mb, perplexity_mb = self.vqvae(raw_obs_mb)
+
+                    recon_loss = F.mse_loss(recon_obs_mb, raw_obs_mb)
+                    total_vq_loss = recon_loss + vq_loss_mb
+
+                    epoch_vq_losses.append(vq_loss_mb.item())
+                    epoch_recon_losses.append(recon_loss.item())
+                    epoch_perplexities.append(perplexity_mb.item())
+
+                    self.optimizer.zero_grad()
+                    total_vq_loss.backward()
+                    # Only VQVAE params will have gradients, so agent is unaffected.
+                    nn.utils.clip_grad_norm_(
+                        self.vqvae.parameters(), self.max_grad_norm
+                    )
+                    self.optimizer.step()
+                    del raw_obs_mb, recon_obs_mb, vq_loss_mb, recon_loss
+                    del total_vq_loss, perplexity_mb
+                    torch.cuda.empty_cache()
+
+                print(self.vqvae.vq_layer.embedding.weight)
+
+                vq_losses.append(np.mean(epoch_vq_losses))
+                recon_losses.append(np.mean(epoch_recon_losses))
+                perplexities.append(np.mean(epoch_perplexities))
+                pbar.set_postfix(
+                    recon_loss=np.mean(epoch_recon_losses),
+                    vq_loss=np.mean(epoch_vq_losses),
+                    perplexity=np.mean(epoch_perplexities),
+                )
+
+                if self.vqvae and hasattr(self.vqvae, "reset_dead_codes"):
+                    self.vqvae.reset_dead_codes(batch_raw_observations)
+
+        return {
+            "losses/vq_loss": vq_losses[-1],
+            "losses/recon_loss": recon_losses[-1],
+            "charts/vq_perplexity": perplexities[-1],
+        }
+
     def calculate_dissimilarity_loss(self, prototypes):
         normed_prototypes = F.normalize(prototypes, p=2, dim=1, eps=1e-8)
         similarity_matrix = torch.matmul(normed_prototypes, normed_prototypes.t())
@@ -345,7 +577,7 @@ class PPO:
                     raw_obs_mb = batch_raw_observations[minibatch_indices]
                     encoded_mb = self.vqvae.encoder(raw_obs_mb)
                     agent_obs_mb, vq_loss_mb, perplexity_mb, _ = self.vqvae.vq_layer(
-                        encoded_mb, is_training=True
+                        encoded_mb
                     )
                     recon_obs_mb = self.vqvae.decoder(agent_obs_mb)
                     recon_loss = F.mse_loss(recon_obs_mb, raw_obs_mb)
@@ -407,7 +639,7 @@ class PPO:
                     epoch_dissimilarity_losses.append(dissimilarity_loss.item())
 
                 loss = (
-                    pg_loss
+                    self.policy_gradient_loss_coefficient * pg_loss
                     - self.entropy_loss_coefficient * entropy_loss
                     + self.value_function_loss_coefficient * v_loss
                     + self.vq_loss_coefficient * total_vq_loss
@@ -426,16 +658,15 @@ class PPO:
                 nn.utils.clip_grad_norm_(params_to_clip, self.max_grad_norm)
                 self.optimizer.step()
 
-            if self.target_kl is not None and approx_kl > self.target_kl:
+            if self.target_kl > 0 and approx_kl > self.target_kl:
                 break
-
-        # After each full update, decay the VQ-VAE temperature
-        if self.vqvae and hasattr(self.vqvae, "decay_temperature"):
-            self.vqvae.decay_temperature()
 
         y_pred, y_true = batch_values.cpu().numpy(), batch_returns.cpu().numpy()
         var_y = np.var(y_true)
         explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
+
+        if self.vqvae and hasattr(self.vqvae, "reset_dead_codes"):
+            self.vqvae.reset_dead_codes(batch_raw_observations)
 
         update_results = {
             "losses/policy_loss": np.mean(epoch_pg_losses),

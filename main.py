@@ -1,3 +1,4 @@
+import json
 import os
 import random
 import time
@@ -71,11 +72,11 @@ class PyTorchImageWrapper(gym.ObservationWrapper):
         old_shape = self.observation_space.shape
         new_shape = (old_shape[2], old_shape[0], old_shape[1])
         self.observation_space = gym.spaces.Box(
-            low=0, high=255, shape=new_shape, dtype=np.uint8
+            low=0, high=1, shape=new_shape, dtype=np.float32
         )
 
     def observation(self, observation):
-        return np.transpose(observation, (2, 0, 1))
+        return np.transpose(observation, (2, 0, 1)) / 255.0
 
 
 def make_continuous_env(
@@ -147,9 +148,11 @@ def load_and_evaluate_model(
     if use_vqvae:
         obs_shape = eval_envs.single_observation_space.shape
         if len(obs_shape) > 2:  # Image
-            vqvae = VQVAE_CNN(obs_shape[0], vq_num_embeddings, vq_embedding_dim).to(
-                device
-            )
+            vqvae = VQVAE_CNN(
+                input_channels=obs_shape[0],
+                num_embeddings=vq_num_embeddings,
+                embedding_dim=vq_embedding_dim,
+            ).to(device)
             # For attention agent, obs space is a grid
             with torch.no_grad():
                 grid_shape = vqvae.encoder(torch.zeros(1, *obs_shape).to(device)).shape
@@ -206,18 +209,20 @@ def load_and_evaluate_model(
 
 @script
 def run_ppo(
-    env_id: str = "Hopper-v4",
+    env_id: str = "Hopper-v5",
     agent_type: str = "attention",  # continuous, prototype, or attention
     use_image_obs: bool = True,
     use_vqvae: bool = True,
     num_prototypes: int = 32,
     vq_num_embeddings: int = 512,
     vq_embedding_dim: int = 128,
-    vq_commitment_cost: float = 0.25,
-    vq_temp_decay: float = 0.999,
-    vq_loss_coefficient: float = 1.0,
+    vq_commitment_cost: float = 0.001,
+    vq_cluster_beta: float = 0.6,
+    vq_loss_coefficient: float = 0.001,
+    vqvae_warmup_steps: int = 10000,
+    vqvae_train_epochs: int = 10,
     dissimilarity_loss_coefficient: float = 0.1,
-    learning_rate: float = 0.0001,
+    learning_rate: float = 0.0003,
     num_envs: int = 4,
     total_timesteps: int = 1000000,
     num_rollout_steps: int = 512,
@@ -227,9 +232,10 @@ def run_ppo(
     gae_lambda: float = 0.95,
     surrogate_clip_threshold: float = 0.2,
     entropy_loss_coefficient: float = 0.0,
+    policy_gradient_loss_coefficient: float = 4.0,
     value_function_loss_coefficient: float = 0.5,
     max_grad_norm: float = 0.5,
-    target_kl: Optional[float] = None,
+    target_kl: float = -1,
     anneal_lr: bool = True,
     normalize_advantages: bool = True,
     clip_value_function_loss: bool = True,
@@ -242,7 +248,8 @@ def run_ppo(
     exp_name = "agent.rl_model"
     run_name = f"{env_id}__{agent_type}__{seed}__{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
     set_seed(seed, torch_deterministic)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cpu")
     print(f"Using device: {device}")
 
     envs = create_envs(env_id, num_envs, capture_video, run_name, gamma, use_image_obs)
@@ -252,18 +259,17 @@ def run_ppo(
 
     # --- VQ-VAE and Agent Setup ---
     vqvae, agent_class, mock_env = None, None, envs
-    params_to_optimize = []
 
     if use_vqvae:
         print(f"Using VQ-VAE with embedding dim: {vq_embedding_dim}")
         obs_shape = envs.single_observation_space.shape
         if len(obs_shape) > 2:  # Image-like obs
             vqvae = VQVAE_CNN(
-                obs_shape[0],
-                vq_num_embeddings,
-                vq_embedding_dim,
-                vq_commitment_cost,
-                temp_decay_rate=vq_temp_decay,
+                input_channels=obs_shape[0],
+                num_embeddings=vq_num_embeddings,
+                embedding_dim=vq_embedding_dim,
+                commitment_cost=vq_commitment_cost,
+                cluster_beta=vq_cluster_beta,
             ).to(device)
             # Calculate the spatial shape of the feature map for the mock env
             with torch.no_grad():
@@ -286,7 +292,6 @@ def run_ppo(
             single_observation_space=mock_obs_space,
             single_action_space=envs.single_action_space,
         )
-        params_to_optimize += list(vqvae.parameters())
 
     # --- Agent Selection ---
     if agent_type == "attention":
@@ -301,16 +306,33 @@ def run_ppo(
         agent_class = partial(ContinuousAgent)
 
     agent = agent_class(mock_env).to(device)
-    params_to_optimize += list(agent.parameters())
     print(agent)
 
-    optimizer = optim.Adam(params_to_optimize, lr=learning_rate, eps=1e-5)
+    # MODIFICATION: Create an optimizer with different parameter groups and learning rates
+    if use_vqvae and vqvae is not None:
+        print(
+            f"Setting up optimizer with two parameter groups. Agent LR: {learning_rate}, VQ-VAE LR: {learning_rate * 0.1}"
+        )
+        optimizer = optim.Adam(
+            [
+                {"params": agent.parameters(), "lr": learning_rate},
+                {
+                    "params": vqvae.parameters(),
+                    "lr": learning_rate,
+                },  # VQ-VAE gets a smaller LR
+            ],
+            eps=1e-5,
+        )
+    else:
+        optimizer = optim.Adam(agent.parameters(), lr=learning_rate, eps=1e-5)
 
     ppo = PPO(
         agent=agent,
         optimizer=optimizer,
         envs=envs,
         vqvae=vqvae,
+        vqvae_warmup_steps=vqvae_warmup_steps,
+        vqvae_train_epochs=vqvae_train_epochs,
         vq_embedding_dim=vq_embedding_dim if use_vqvae else None,
         vq_loss_coefficient=vq_loss_coefficient,
         dissimilarity_loss_coefficient=dissimilarity_loss_coefficient,
@@ -322,6 +344,7 @@ def run_ppo(
         surrogate_clip_threshold=surrogate_clip_threshold,
         entropy_loss_coefficient=entropy_loss_coefficient,
         value_function_loss_coefficient=value_function_loss_coefficient,
+        policy_gradient_loss_coefficient=policy_gradient_loss_coefficient,
         max_grad_norm=max_grad_norm,
         update_epochs=update_epochs,
         num_minibatches=num_minibatches,
@@ -343,6 +366,10 @@ def run_ppo(
             checkpoint["vqvae_state_dict"] = vqvae.state_dict()
         torch.save(checkpoint, model_path)
         print(f"Model saved to {model_path}")
+        hyperparameters = locals()
+        with open(f"runs/{run_name}/hyperparameters.json", "w") as f:
+            json.dump(hyperparameters, f, indent=4)
+        print(f"Hyperparameters saved to runs/{run_name}/hyperparameters.json")
 
         load_and_evaluate_model(
             run_name,
