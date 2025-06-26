@@ -319,6 +319,7 @@ class PPO:
                 next_observation = torch.as_tensor(
                     next_observation, dtype=torch.float32, device=self.device
                 )
+                self._global_step += self.num_envs
             return (
                 raw_observations_storage.reshape(
                     (-1,) + self.envs.single_observation_space.shape
